@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Flipbook dari PDF — dengan Cover</title>
+
+<!-- PDF.js -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+
+<style>
+  :root{
+    --max-w:900px; --max-h:600px; --accent:#2b72c9;
+  }
+  html,body{height:100%;margin:0;font-family:Arial,Helvetica,sans-serif;background:#eef6fb;display:flex;flex-direction:column;align-items:center;padding:12px;box-sizing:border-box;}
+  .container{width:100%;max-width:var(--max-w);display:flex;flex-direction:column;gap:12px;align-items:center}
+
+  .book{
+    width:100%;
+    height:min(80vh,var(--max-h));
+    background:#fff;border-radius:12px;overflow:hidden;position:relative;
+    perspective:2000px;box-shadow:0 12px 30px rgba(0,0,0,0.12);
+  }
+
+  .loader{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:linear-gradient(180deg, rgba(255,255,255,0.9), rgba(255,255,255,0.7));z-index:9999;font-weight:700}
+  .loader small{font-weight:600;color:#333;opacity:.9}
+
+  .pages{position:relative;width:100%;height:100%}
+  .page{position:absolute;inset:0;transform-style:preserve-3d;transform-origin:left;transition:transform .7s cubic-bezier(.2,.8,.2,1)}
+  .face{position:absolute;inset:0;backface-visibility:hidden;overflow:hidden;background:#fff;display:flex;align-items:center;justify-content:center}
+  .face img{width:100%;height:100%;object-fit:cover;display:block}
+  .face canvas{width:100%;height:100%;object-fit:contain;display:block}
+
+  .back{transform:rotateY(180deg)}
+  .flipped{transform:rotateY(-180deg)}
+  .page::after{content:"";position:absolute;inset:0;background:linear-gradient(to left, rgba(0,0,0,0.25), transparent);opacity:0;transition:opacity .6s}
+  .page.flipped::after{opacity:.5}
+
+  .page-number{position:absolute;bottom:8px;width:100%;text-align:center;font-weight:700;color:#222;pointer-events:none;z-index:3}
+
+  .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:center}
+  .controls button{background:var(--accent);color:#fff;border:none;padding:10px 14px;border-radius:8px;cursor:pointer;font-weight:700}
+  .controls input{width:80px;padding:8px;border-radius:6px;border:1px solid #ccc;text-align:center}
+
+  .telegram{position:fixed;right:18px;bottom:18px;width:60px;height:60px;border-radius:50%;background:#229ed9;display:flex;align-items:center;justify-content:center;box-shadow:0 6px 18px rgba(0,0,0,0.18);z-index:9999}
+  .telegram img{width:34px;height:34px}
+
+  .err{color:#b00;font-weight:700;margin-top:8px}
+
+  @media (max-width:420px){ .controls button{padding:8px 10px;font-size:14px} .page-number{font-size:14px} }
+</style>
+</head>
+<body>
+  <div class="container">
+    <h2 style="margin:0">MRZYB-KOMIK</h2>
+
+    <div class="book" id="book">
+      <div class="loader" id="loader">Memuat PDF… <small id="progress">0%</small></div>
+      <div class="pages" id="pages"></div>
+    </div>
+
+    <div class="controls">
+      <button id="prev">◀ Prev</button>
+      <button id="next">Next ▶</button>
+      <label style="display:flex;align-items:center;gap:8px"><b>Halaman isi:</b>
+        <input id="goto" type="number" min="1" value="1">
+      </label>
+      <button id="go">Go</button>
+    </div>
+
+    <div id="error" class="err" style="display:none"></div>
+  </div>
+
+  <a class="telegram" href="https://t.me/mrzyb_movie" target="_blank" rel="noopener">
+    <img alt="tg" src="https://upload.wikimedia.org/wikipedia/commons/8/82/Telegram_logo.svg">
+  </a>
+
+  <!-- flip sound -->
+  <audio id="flipAudio" preload="auto">
+    <source src="https://www.soundjay.com/mechanical/sounds/book-page-flip-4.mp3" type="audio/mpeg">
+  </audio>
+
+
+<script>
+/* CONFIG */
+const PDF_RAW = "https://raw.githack.com/Ukie4321/Doraemonend/main/komikakhirdoraemonku.pdf"; // your raw.githack link
+const COVER_FRONT = "https://raw.githubusercontent.com/Ukie4321/Mrzybposter/refs/heads/main/PicRetouch_20251203_115331698.png";
+const COVER_BACK  = "https://raw.githubusercontent.com/Ukie4321/Mrzybposter/refs/heads/main/PicRetouch_20251203_120432778.png";
+const SCALE_MULT = 1.2; // rendering scale multiplier
+
+
+/* DOM */
+const loader = document.getElementById('loader');
+const progressEl = document.getElementById('progress');
+const pagesWrap = document.getElementById('pages');
+const errEl = document.getElementById('error');
+const prevBtn = document.getElementById('prev');
+const nextBtn = document.getElementById('next');
+const gotoInput = document.getElementById('goto');
+const goBtn = document.getElementById('go');
+const flipAudio = document.getElementById('flipAudio');
+
+let pdfDoc = null;
+let pageEls = []; // .page elements (cover front + pdf pages + cover back)
+let current = 0;
+let numPdfPages = 0;
+
+/* helper to play flip */
+function playFlip(){ if(flipAudio){ flipAudio.currentTime = 0; flipAudio.play().catch(()=>{}); } }
+
+/* update pages visuals */
+function updatePages(){
+  pageEls.forEach((pg,i)=>{
+    pg.style.zIndex = pageEls.length - i;
+    if(i < current) pg.classList.add('flipped'); else pg.classList.remove('flipped');
+  });
+  // show content page number in input (1..numPdfPages). If on cover front (index 0) show 0, if on cover back show numPdfPages+1
+  if(current === 0) gotoInput.value = 0;
+  else if(current === pageEls.length - 1) gotoInput.value = numPdfPages + 1;
+  else gotoInput.value = current; // since we inserted coverFront at index 0, PDF page 1 is index 1 => display 1
+  prevBtn.disabled = current <= 0;
+  nextBtn.disabled = current >= pageEls.length - 1;
+}
+
+/* navigation */
+function nextPage(){ if(current < pageEls.length - 1){ current++; updatePages(); playFlip(); } }
+function prevPage(){ if(current > 0){ current--; updatePages(); playFlip(); } }
+function jumpToContent(n){
+  // accepts: 0 = cover front, 1..numPdfPages = pdf pages, numPdfPages+1 = cover back
+  if(isNaN(n)) return;
+  let target = parseInt(n,10);
+  if(target < 0) target = 0;
+  if(target > numPdfPages + 1) target = numPdfPages + 1;
+  current = target; // because cover front index 0, pdf page k index k
+  updatePages(); playFlip();
+}
+
+/* attach controls */
+prevBtn.addEventListener('click', prevPage);
+nextBtn.addEventListener('click', nextPage);
+goBtn.addEventListener('click', ()=> jumpToContent(parseInt(gotoInput.value,10)||0));
+window.addEventListener('keydown', e => { if(e.key==='ArrowRight') nextPage(); if(e.key==='ArrowLeft') prevPage(); });
+
+/* swipe */
+let startX=0;
+pagesWrap.addEventListener('touchstart', e => { if(e.touches && e.touches[0]) startX = e.touches[0].clientX; }, {passive:true});
+pagesWrap.addEventListener('touchend', e => {
+  if(!e.changedTouches) return;
+  const dx = e.changedTouches[0].clientX - startX;
+  if(Math.abs(dx) > 50){ if(dx < 0) nextPage(); else prevPage(); }
+}, {passive:true});
+
+/* PDF rendering helpers */
+async function renderPdfPage(pdf, pageNum, scale){
+  const page = await pdf.getPage(pageNum);
+  const viewport = page.getViewport({scale: scale});
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.floor(viewport.width);
+  canvas.height = Math.floor(viewport.height);
+  const ctx = canvas.getContext('2d', { alpha:false });
+  await page.render({canvasContext: ctx, viewport}).promise;
+  return canvas;
+}
+
+/* Build cover element */
+function buildCover(src, zIndex){
+  const page = document.createElement('div'); page.className='page'; page.style.zIndex = zIndex;
+  const front = document.createElement('div'); front.className='face front';
+  const back = document.createElement('div'); back.className='face back';
+  const imgF = document.createElement('img'); imgF.src = src; front.appendChild(imgF);
+  const imgB = document.createElement('img'); imgB.src = src; back.appendChild(imgB);
+  page.appendChild(front); page.appendChild(back);
+  return page;
+}
+
+/* Build page element from canvases and assign number if content */
+function buildPdfPage(canvasFront, canvasBack, pageIndex /*1-based PDF page*/) {
+  const page = document.createElement('div'); page.className='page';
+  const front = document.createElement('div'); front.className='face front';
+  const back = document.createElement('div'); back.className='face back';
+  // append canvases
+  front.appendChild(canvasFront);
+  back.appendChild(canvasBack);
+  // add page-number on front only (MODE B style: 1..N)
+  const num = document.createElement('div'); num.className='page-number'; num.textContent = pageIndex;
+  front.appendChild(num);
+  page.appendChild(front); page.appendChild(back);
+  return page;
+}
+
+/* Main: load PDF and create DOM (cover front + pdf pages + cover back) */
+async function loadAndBuild(pdfUrl){
+  loader.style.display = 'flex';
+  progressEl.textContent = '0%';
+  errEl.style.display = 'none';
+  pagesWrap.innerHTML = '';
+  pageEls = [];
+
+  try {
+    // set worker
+    if(window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+    else throw new Error('PDF.js tidak tersedia');
+
+    // fetch PDF (arrayBuffer)
+    const resp = await fetch(pdfUrl);
+    if(!resp.ok) throw new Error('Gagal mengunduh PDF: ' + resp.status);
+    const buf = await resp.arrayBuffer();
+
+    // load doc
+    pdfDoc = await pdfjsLib.getDocument({data: buf}).promise;
+    numPdfPages = pdfDoc.numPages;
+
+    // create cover front
+    const coverFront = buildCover(COVER_FRONT, 9999);
+    pagesWrap.appendChild(coverFront);
+    pageEls.push(coverFront);
+
+    // scale calculation
+    const containerW = pagesWrap.clientWidth || 800;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const baseScale = (containerW / 800) * (dpr * 0.95);
+    const finalScale = Math.max(0.7, baseScale) * SCALE_MULT;
+
+    // render PDF pages one by one
+    for(let p=1; p<=numPdfPages; p++){
+      progressEl.textContent = `${Math.round((p-1)/numPdfPages*100)}%`;
+      const canvasFront = await renderPdfPage(pdfDoc, p, finalScale);
+      // create a copy for back
+      const canvasBack = document.createElement('canvas');
+      canvasBack.width = canvasFront.width; canvasBack.height = canvasFront.height;
+      canvasBack.getContext('2d').drawImage(canvasFront,0,0);
+      const pageEl = buildPdfPage(canvasFront, canvasBack, p);
+      pagesWrap.appendChild(pageEl);
+      pageEls.push(pageEl);
+    }
+
+    // cover back
+    const coverBack = buildCover(COVER_BACK, 1);
+    pagesWrap.appendChild(coverBack);
+    pageEls.push(coverBack);
+
+    // set z-index based on order (desc)
+    pageEls.forEach((pg,i)=> pg.style.zIndex = pageEls.length - i);
+
+    // init
+    current = 0;
+    updatePages();
+    loader.style.display = 'none';
+    progressEl.textContent = '100%';
+
+  } catch(err) {
+    console.error(err);
+    loader.style.display = 'none';
+    errEl.style.display = 'block';
+    errEl.textContent = 'Gagal memuat PDF: ' + err.message + '. Jika error CORS, upload file ke raw.githack atau tmpfiles/anonfiles dan gunakan link tersebut.';
+  }
+}
+
+/* start */
+loadAndBuild(PDF_RAW);
+
+/* responsive: if container resized, you may want to re-render for better quality.
+   For simplicity we keep rendered canvases; to re-render at new scale, you can re-run loadAndBuild.
+*/
+
+/* small UX: clicking on a page toggles next (like tap to flip) */
+pagesWrap.addEventListener('click', (e)=>{
+  // avoid clicks on controls
+  if(e.target.closest('.controls')) return;
+  // next page on click-right side, prev on click-left
+  const rect = pagesWrap.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  if(x > rect.width*0.6) nextPage(); else prevPage();
+});
+
+</script>
+
+</body>
+</html>
